@@ -357,3 +357,39 @@ def test_delete_by_metadata_complex(singlestore_db, mock_session):
         result = singlestore_db.delete_by_metadata({"spicy": False})
         assert result is True
         mock_delete_by_metadata.assert_called_once_with({"spicy": False})
+
+
+@pytest.mark.parametrize("distance", [Distance.l2, Distance.max_inner_product])
+def test_search_orders_by_each_distance_metric(mock_engine, mock_session, mock_embedder, distance):
+    """search() must work for every Distance value, not only the default cosine (agno-agi/agno#11452).
+
+    The table declares `embedding` as a placeholder TEXT column while create() issues a real
+    VECTOR(n) column, so ordering must go through SQL functions (as the cosine branch does)
+    instead of pgvector-style column methods that a plain Column does not have.
+    """
+    with patch("agno.vectordb.singlestore.singlestore.sessionmaker") as mock_sessionmaker:
+        mock_sessionmaker.return_value = mock_session
+        db = SingleStore(
+            collection=TEST_COLLECTION,
+            schema=TEST_SCHEMA,
+            db_engine=mock_engine,
+            embedder=mock_embedder,
+            distance=distance,
+        )
+        db.create()
+        mock_session.execute.return_value.fetchall.return_value = []
+
+        # RED check: on unmodified code this raises AttributeError for both metrics.
+        assert db.search("hello") == []
+
+        stmt = mock_session.execute.call_args_list[-1][0][0]
+        sql = str(stmt)
+        if distance == Distance.l2:
+            # Smaller euclidean distance is closer -> ascending order, no DESC.
+            assert "euclidean_distance(" in sql
+            assert "DESC" not in sql
+        else:
+            # Larger inner product is better -> descending dot product.
+            assert "dot_product(" in sql
+            assert "DESC" in sql
+        assert "max_inner_product(" not in sql
