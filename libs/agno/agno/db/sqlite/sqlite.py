@@ -2583,7 +2583,9 @@ class SqliteDb(BaseDb):
 
                 result = sess.execute(stmt).fetchall()
                 if not result:
-                    return [] if deserialize else ([], 0)
+                    # Keep the filtered total: an empty page must not report zero
+                    # memories when other pages still match the filters.
+                    return [] if deserialize else ([], total_count)
 
                 memories_raw = [record._mapping for record in result]
 

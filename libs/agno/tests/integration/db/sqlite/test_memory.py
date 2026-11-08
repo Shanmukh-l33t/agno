@@ -119,3 +119,32 @@ def test_get_all_memory_topics_tenant_isolation(sqlite_db_real: SqliteDb):
     assert "alice_only" not in bob_topics
     assert "bob_only" in bob_topics
     assert "bob_only" not in alice_topics
+
+
+def test_get_user_memories_empty_page_keeps_total_count(sqlite_db_real: SqliteDb):
+    """An empty requested page must still report the filtered total count (issue #11499)."""
+    for i in range(3):
+        sqlite_db_real.upsert_user_memory(
+            UserMemory(memory_id=f"m{i}", memory=f"Synthetic memory {i}", user_id="alice"), deserialize=True
+        )
+
+    rows, total = sqlite_db_real.get_user_memories(
+        user_id="alice", limit=2, page=3, sort_by="memory_id", sort_order="asc", deserialize=False
+    )
+    assert len(rows) == 0
+    assert total == 3  # page 3 is empty but three memories match the filter
+
+    # Deleting the only item on the last page must not zero the reported total.
+    sqlite_db_real.delete_user_memory("m2", user_id="alice")
+    rows, total = sqlite_db_real.get_user_memories(
+        user_id="alice", limit=2, page=2, sort_by="memory_id", sort_order="asc", deserialize=False
+    )
+    assert len(rows) == 0
+    assert total == 2
+
+    # Non-empty pages keep reporting the same filtered total.
+    rows, total = sqlite_db_real.get_user_memories(
+        user_id="alice", limit=2, page=1, sort_by="memory_id", sort_order="asc", deserialize=False
+    )
+    assert len(rows) == 2
+    assert total == 2
