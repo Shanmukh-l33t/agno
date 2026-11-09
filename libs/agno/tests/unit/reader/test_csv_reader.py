@@ -217,7 +217,28 @@ async def test_async_read_rejects_negative_page_size(tmp_path, page_size, row_co
         source = io.BytesIO(content.encode("utf-8"))
         source.seek(3)
 
-    with pytest.raises(ValueError, match=re.escape("page_size cannot be a negative value.")):
+    with pytest.raises(ValueError, match=re.escape("page_size must be a positive value.")):
+        await CSVReader().async_read(source, page_size=page_size)
+
+    if source_type == "stream":
+        assert source.tell() == 3
+        assert not source.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page_size", [0])
+@pytest.mark.parametrize("row_count", [0, 3, 12])
+@pytest.mark.parametrize("source_type", ["path", "stream"])
+async def test_async_read_rejects_zero_page_size(tmp_path, page_size, row_count, source_type):
+    content = "name,age\n" + "\n".join(f"row{i},{i}" for i in range(row_count))
+    if source_type == "path":
+        source = tmp_path / "input.csv"
+        source.write_text(content, encoding="utf-8")
+    else:
+        source = io.BytesIO(content.encode("utf-8"))
+        source.seek(3)
+
+    with pytest.raises(ValueError, match=re.escape("page_size must be a positive value.")):
         await CSVReader().async_read(source, page_size=page_size)
 
     if source_type == "stream":
