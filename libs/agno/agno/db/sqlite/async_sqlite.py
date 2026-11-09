@@ -2420,7 +2420,7 @@ class AsyncSqliteDb(AsyncBaseDb):
             Exception: If an error occurs during upsert.
         """
         try:
-            table = await self._get_table(table_type="memories")
+            table = await self._get_table(table_type="memories", create_table_if_not_found=True)
             if table is None:
                 return None
 
@@ -2497,7 +2497,7 @@ class AsyncSqliteDb(AsyncBaseDb):
             return []
 
         try:
-            table = await self._get_table(table_type="memories")
+            table = await self._get_table(table_type="memories", create_table_if_not_found=True)
             if table is None:
                 log_info("Memories table not available, falling back to individual upserts")
                 return [
