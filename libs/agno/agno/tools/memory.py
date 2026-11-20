@@ -1,6 +1,7 @@
 import json
+import threading
 from textwrap import dedent
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from agno.db.base import BaseDb
@@ -41,6 +42,12 @@ class MemoryTools(Toolkit):
         # The database to use for memory operations
         self.db: BaseDb = db
 
+        # One lock per memory id: update_memory is a read-modify-write, and same-turn tool
+        # calls run in worker threads, so two calls for one memory id could each merge onto
+        # the same stale snapshot. Reentrant so a tool call may re-enter for the same id.
+        self._memory_locks: Dict[str, threading.RLock] = {}
+        self._memory_locks_guard = threading.Lock()
+
         tools: List[Any] = []
         if enable_think or all:
             tools.append(self.think)
@@ -63,6 +70,13 @@ class MemoryTools(Toolkit):
             **kwargs,
         )
 
+    def _memory_lock(self, memory_id: str) -> threading.RLock:
+        """Lock for one memory id, so updates to unrelated memories never serialise."""
+        # Guarded: setdefault's factory is Python code, so a bare setdefault can hand two
+        # threads two different locks for the same id.
+        with self._memory_locks_guard:
+            return self._memory_locks.setdefault(memory_id, threading.RLock())
+
     def think(self, run_context: RunContext, thought: str) -> str:
         """Use this tool as a scratchpad to reason about memory operations, refine your approach, brainstorm memory content, or revise your plan.
 
@@ -78,12 +92,11 @@ class MemoryTools(Toolkit):
             # Add the thought to the session state
             if run_context.session_state is None:
                 run_context.session_state = {}
-            if "memory_thoughts" not in run_context.session_state:
-                run_context.session_state["memory_thoughts"] = []
-            run_context.session_state["memory_thoughts"].append(thought)
+            thoughts_log = run_context.session_state.setdefault("memory_thoughts", [])
+            thoughts_log.append(thought)
 
             # Return the full log of thoughts and the new thought
-            thoughts = "\n".join([f"- {t}" for t in run_context.session_state["memory_thoughts"]])
+            thoughts = "\n".join([f"- {t}" for t in thoughts_log])
             formatted_thoughts = dedent(
                 f"""Memory Thoughts:
                 {thoughts}
@@ -107,8 +120,7 @@ class MemoryTools(Toolkit):
             # Store the result in session state for analysis
             if run_context.session_state is None:
                 run_context.session_state = {}
-            if "memory_operations" not in run_context.session_state:
-                run_context.session_state["memory_operations"] = []
+            operations = run_context.session_state.setdefault("memory_operations", [])
 
             operation_result = {
                 "operation": "get_memories",
@@ -116,7 +128,7 @@ class MemoryTools(Toolkit):
                 "memories": [memory.to_dict() for memory in memories],  # type: ignore
                 "error": None,
             }
-            run_context.session_state["memory_operations"].append(operation_result)
+            operations.append(operation_result)
 
             return json.dumps([memory.to_dict() for memory in memories], indent=2)  # type: ignore
         except Exception as e:
@@ -158,8 +170,7 @@ class MemoryTools(Toolkit):
             # Store the result in session state for analysis
             if run_context.session_state is None:
                 run_context.session_state = {}
-            if "memory_operations" not in run_context.session_state:
-                run_context.session_state["memory_operations"] = []
+            operations = run_context.session_state.setdefault("memory_operations", [])
 
             memory_dict = created_memory.to_dict() if created_memory else None  # type: ignore
 
@@ -169,7 +180,7 @@ class MemoryTools(Toolkit):
                 "memory": memory_dict,
                 "error": None,
             }
-            run_context.session_state["memory_operations"].append(operation_result)
+            operations.append(operation_result)
 
             if created_memory:
                 return json.dumps({"success": True, "operation": "add_memory", "memory": memory_dict}, indent=2)
@@ -202,30 +213,35 @@ class MemoryTools(Toolkit):
         try:
             log_debug(f"Updating memory: {memory_id}")
 
-            # First get the existing memory
-            existing_memory = self.db.get_user_memory(memory_id)
-            if not existing_memory:
-                return json.dumps(
-                    {"success": False, "operation": "update_memory", "error": f"Memory with ID {memory_id} not found"},
-                    indent=2,
+            # Get the existing memory. The lock is held for the whole read-merge-upsert, so a
+            # concurrent call for the same memory id cannot merge onto the same snapshot.
+            with self._memory_lock(memory_id):
+                existing_memory = self.db.get_user_memory(memory_id)
+                if not existing_memory:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "operation": "update_memory",
+                            "error": f"Memory with ID {memory_id} not found",
+                        },
+                        indent=2,
+                    )
+
+                # Update fields if provided
+                updated_memory = UserMemory(
+                    memory=memory if memory is not None else existing_memory.memory,  # type: ignore
+                    memory_id=memory_id,
+                    topics=topics if topics is not None else existing_memory.topics,  # type: ignore
+                    user_id=existing_memory.user_id,  # type: ignore
                 )
 
-            # Update fields if provided
-            updated_memory = UserMemory(
-                memory=memory if memory is not None else existing_memory.memory,  # type: ignore
-                memory_id=memory_id,
-                topics=topics if topics is not None else existing_memory.topics,  # type: ignore
-                user_id=existing_memory.user_id,  # type: ignore
-            )
-
-            # Update in database
-            updated_result = self.db.upsert_user_memory(updated_memory)
+                # Update in database
+                updated_result = self.db.upsert_user_memory(updated_memory)
 
             # Store the result in session state for analysis
             if run_context.session_state is None:
                 run_context.session_state = {}
-            if "memory_operations" not in run_context.session_state:
-                run_context.session_state["memory_operations"] = []
+            operations = run_context.session_state.setdefault("memory_operations", [])
 
             memory_dict = updated_result.to_dict() if updated_result else None  # type: ignore
 
@@ -235,7 +251,7 @@ class MemoryTools(Toolkit):
                 "memory": memory_dict,
                 "error": None,
             }
-            run_context.session_state["memory_operations"].append(operation_result)
+            operations.append(operation_result)
 
             if updated_result:
                 return json.dumps({"success": True, "operation": "update_memory", "memory": memory_dict}, indent=2)
@@ -264,22 +280,27 @@ class MemoryTools(Toolkit):
         try:
             log_debug(f"Deleting memory: {memory_id}")
 
-            # Check if memory exists before deletion
-            existing_memory = self.db.get_user_memory(memory_id)
-            if not existing_memory:
-                return json.dumps(
-                    {"success": False, "operation": "delete_memory", "error": f"Memory with ID {memory_id} not found"},
-                    indent=2,
-                )
+            # Check if memory exists before deletion. Same lock as update_memory so a
+            # delete cannot land between another call's read and its upsert.
+            with self._memory_lock(memory_id):
+                existing_memory = self.db.get_user_memory(memory_id)
+                if not existing_memory:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "operation": "delete_memory",
+                            "error": f"Memory with ID {memory_id} not found",
+                        },
+                        indent=2,
+                    )
 
-            # Delete from database
-            self.db.delete_user_memory(memory_id)
+                # Delete from database
+                self.db.delete_user_memory(memory_id)
 
             # Store the result in session state for analysis
             if run_context.session_state is None:
                 run_context.session_state = {}
-            if "memory_operations" not in run_context.session_state:
-                run_context.session_state["memory_operations"] = []
+            operations = run_context.session_state.setdefault("memory_operations", [])
 
             memory_dict = existing_memory.to_dict() if existing_memory else None  # type: ignore
 
@@ -290,7 +311,7 @@ class MemoryTools(Toolkit):
                 "deleted_memory": memory_dict,
                 "error": None,
             }
-            run_context.session_state["memory_operations"].append(operation_result)
+            operations.append(operation_result)
 
             return json.dumps(
                 {
@@ -319,12 +340,11 @@ class MemoryTools(Toolkit):
             # Add the analysis to the session state
             if run_context.session_state is None:
                 run_context.session_state = {}
-            if "memory_analysis" not in run_context.session_state:
-                run_context.session_state["memory_analysis"] = []
-            run_context.session_state["memory_analysis"].append(analysis)
+            analyses = run_context.session_state.setdefault("memory_analysis", [])
+            analyses.append(analysis)
 
             # Return the full log of analysis and the new analysis
-            analysis_log = "\n".join([f"- {a}" for a in run_context.session_state["memory_analysis"]])
+            analysis_log = "\n".join([f"- {a}" for a in analyses])
             formatted_analysis = dedent(
                 f"""Memory Analysis:
                 {analysis_log}
